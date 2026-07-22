@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Dynamic GLTF Car Loader with PBR Paint</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #08080c; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; }
+        
+        #loading-overlay {
+            position: absolute; top: 0; left: 0; width: 100vw; height: 100vh;
+            background: rgba(0,0,0,0.8); color: #00d9ff; display: flex;
+            justify-content: center; align-items: center; font-size: 24px; font-weight: bold;
+            pointer-events: none; opacity: 0; transition: opacity 0.3s;
+        }
+        #loading-overlay.active { opacity: 1; pointer-events: all; }
+
+        #garage-ui {
+            position: absolute; top: 20px; left: 20px;
+            background: rgba(15, 15, 25, 0.85); border: 1px solid rgba(255,255,255,0.1);
+            padding: 20px; border-radius: 12px; color: #fff; width: 280px;
+            backdrop-filter: blur(10px);
+        }
+        .car-option {
+            display: block; width: 100%; padding: 12px; margin-top: 8px;
+            background: rgba(255,255,255,0.05); border: 1px solid transparent;
+            color: #fff; border-radius: 6px; cursor: pointer; text-align: left;
+            transition: 0.2s;
+        }
+        .car-option:hover { background: rgba(0, 217, 255, 0.2); border-color: #00d9ff; }
+    </style>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.165.0/build/three.webgpu.js",
+          "three/webgpu": "https://unpkg.com/three@0.165.0/build/three.webgpu.js",
+          "three/addons/": "https://unpkg.com/three@0.165.0/examples/jsm/"
+        }
+      }
+    </script>
+</head>
+<body>
+
+    <div id="canvas-container"></div>
+    <div id="loading-overlay">🏎️ 正在載入 GLTF 跑車模型...</div>
+
+    <div id="garage-ui">
+        <h2>🏎️ 跑車選單 (GLTF 動態載入)</h2>
+        <div id="car-buttons"></div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three/webgpu';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+
+        // 1. 定義 20 輛車資料庫 (結合 GLTF 網址與專屬 PBR 烤漆屬性)
+        const CAR_DATABASE = [
+            {
+                id: "car_01",
+                name: "Ferrari F8",
+                // 使用 Three.js 官方範例的跑車 GLTF 模型作為示範網址
+                modelUrl: "https://threejs.org/examples/models/gltf/ferrari.glb",
+                // PBR 專屬漆面設定
+                paint: {
+                    color: 0xcc0000,        // 經典賽車紅
+                    metalness: 0.85,
+                    roughness: 0.1,
+                    clearcoat: 1.0,         // 雙層金油漆
+                    clearcoatRoughness: 0.02
+                },
+                physics: { topSpeed: 340, accel: 0.05 }
+            },
+            {
+                id: "car_02",
+                name: "Ferrari F8 (翡翠綠訂製款)",
+                modelUrl: "https://threejs.org/examples/models/gltf/ferrari.glb",
+                paint: {
+                    color: 0x00aa44,        // 金屬綠
+                    metalness: 0.95,
+                    roughness: 0.15,
+                    clearcoat: 1.0,
+                    clearcoatRoughness: 0.01
+                },
+                physics: { topSpeed: 345, accel: 0.052 }
+            },
+            {
+                id: "car_03",
+                name: "Ferrari F8 (暗夜紫黑金)",
+                modelUrl: "https://threejs.org/examples/models/gltf/ferrari.glb",
+                paint: {
+                    color: 0x220033,        // 深紫金屬漆
+                    metalness: 0.9,
+                    roughness: 0.05,
+                    clearcoat: 1.0,
+                    clearcoatRoughness: 0.05
+                },
+                physics: { topSpeed: 350, accel: 0.055 }
+            }
+        ];
+
+        let scene, camera, renderer, controls;
+        let gltfLoader, currentCarModel = null;
+        const loadingEl = document.getElementById('loading-overlay');
+
+        async function init() {
+            const container = document.getElementById('canvas-container');
+
+            // WebGPU 渲染器初始化
+            renderer = new THREE.WebGPURenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.0;
+            container.appendChild(renderer.domElement);
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x0a0a10);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(4, 1.8, 5);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+
+            gltfLoader = new GLTFLoader();
+
+            // 2. 載入 HDR 環境圖 (IBL 提供反射靈魂)
+            new RGBELoader().load('https://threejs.org/examples/textures/equirectangular/venice_sunset_1k.hdr', (texture) => {
+                texture.mapping = THREE.EquirectangularReflectionMapping;
+                scene.environment = texture;
+                scene.background = texture;
+            });
+
+            // 建立展示台地面
+            const ground = new THREE.Mesh(
+                new THREE.PlaneGeometry(50, 50),
+                new THREE.MeshStandardMaterial({ color: 0x111116, roughness: 0.2, metalness: 0.8 })
+            );
+            ground.rotation.x = -Math.PI / 2;
+            scene.add(ground);
+
+            // 建立選單 UI & 載入首輛跑車
+            buildUI();
+            await loadAndBindCar(CAR_DATABASE[0]);
+
+            window.addEventListener('resize', onWindowResize);
+            renderer.setAnimationLoop(animate);
+        }
+
+        // 3. 核心：GLTF 動態載入與 PBR 材質解構綁定函式
+        async function loadAndBindCar(carData) {
+            loadingEl.classList.add('active');
+
+            // 如果已有舊模型，從場景移除並釋放記憶體
+            if (currentCarModel) {
+                scene.remove(currentCarModel);
+                currentCarModel.traverse(child => {
+                    if (child.isMesh) {
+                        child.geometry.dispose();
+                        if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+                        else child.material.dispose();
+                    }
+                });
+            }
+
+            try {
+                // 異步載入 GLTF 模型
+                const gltf = await gltfLoader.loadAsync(carData.modelUrl);
+                const model = gltf.scene;
+
+                // 建立自訂 WebGPU PBR 雙層車漆材質
+                const customPaintMaterial = new THREE.MeshPhysicalMaterial({
+                    color: new THREE.Color(carData.paint.color),
+                    metalness: carData.paint.metalness,
+                    roughness: carData.paint.roughness,
+                    
+                    // 雙層 Clearcoat 設定
+                    clearcoat: carData.paint.clearcoat,
+                    clearcoatRoughness: carData.paint.clearcoatRoughness,
+                    reflectivity: 1.0,
+                    ior: 1.5
+                });
+
+                // 遍歷 GLTF 車輛樹狀結構，尋找車身網格（Mesh）進行綁定
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+
+                        // 判斷方式：根據 Mesh 名稱、或材質名稱判定是否為「車身烤漆層」
+                        // 提示：大多數專業車輛模型的車身區塊會命名為 body, paint, carbody, exterior 等
+                        const name = child.name.toLowerCase();
+                        const matName = child.material.name.toLowerCase();
+
+                        if (name.includes('body') || matName.includes('body') || matName.includes('paint') || name.includes('rim')) {
+                            // 替換成我們的 PBR 雙層車漆
+                            child.material = customPaintMaterial;
+                        } else {
+                            // 保留玻璃/車燈等原廠材質，但確保其開啟環境反射 (Environment Mapping)
+                            if (child.material) {
+                                child.material.envMapIntensity = 1.2;
+                            }
+                        }
+                    }
+                });
+
+                // 修正模型尺寸與位置
+                model.position.set(0, 0, 0);
+                model.scale.set(1, 1, 1);
+
+                currentCarModel = model;
+                scene.add(currentCarModel);
+
+            } catch (error) {
+                console.error("載入 GLTF 跑車失敗:", error);
+            } finally {
+                loadingEl.classList.remove('active');
+            }
+        }
+
+        // 建立 UI 按鈕
+        function buildUI() {
+            const container = document.getElementById('car-buttons');
+            CAR_DATABASE.forEach(car => {
+                const btn = document.createElement('button');
+                btn.className = 'car-option';
+                btn.innerHTML = `<strong>${car.name}</strong><br><small>極速: ${car.physics.topSpeed} KM/H</small>`;
+                btn.onclick = () => loadAndBindCar(car);
+                container.appendChild(btn);
+            });
+        }
+
+        function animate() {
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        init();
+    </script>
+</body>
+</html>
