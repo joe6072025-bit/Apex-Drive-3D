@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Apex-Drive-3D</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; }
+        #hud {
+            position: absolute; bottom: 30px; right: 30px;
+            color: #fff; font-size: 32px; font-weight: bold;
+            background: rgba(0,0,0,0.6); padding: 15px 25px; border-radius: 12px;
+            backdrop-filter: blur(8px); border: 1px solid rgba(255,255,255,0.1);
+            pointer-events: none; text-shadow: 0 0 10px rgba(0,217,255,0.8);
+        }
+        #garage-panel {
+            position: absolute; top: 20px; left: 20px; width: 260px; max-height: 80vh;
+            background: rgba(15, 15, 25, 0.85); color: #fff; border-radius: 12px;
+            padding: 15px; backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.15);
+            overflow-y: auto; z-index: 100;
+        }
+        #garage-panel h3 { margin-top: 0; color: #00d9ff; border-bottom: 1px solid #333; padding-bottom: 8px; }
+        .car-btn {
+            display: flex; justify-content: space-between; align-items: center;
+            width: 100%; padding: 10px; margin-bottom: 8px; background: rgba(255,255,255,0.05);
+            border: 1px solid transparent; color: #fff; border-radius: 6px; cursor: pointer;
+        }
+        .car-btn:hover { background: rgba(0, 217, 255, 0.2); border-color: #00d9ff; }
+        .car-btn.active { background: #00d9ff; color: #000; font-weight: bold; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.165.0/build/three.webgpu.js",
+          "three/webgpu": "https://unpkg.com/three@0.165.0/build/three.webgpu.js",
+          "three/addons/": "https://unpkg.com/three@0.165.0/examples/jsm/"
+        }
+      }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="hud">0 KM/H</div>
+    <div id="garage-panel">
+        <h3>🏎️ Apex Garage (20 Vehicles)</h3>
+        <div id="car-list"></div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three/webgpu';
+
+        const CAR_DATABASE = Array.from({ length: 20 }, (_, i) => {
+            const brands = ["Ferrari", "Lamborghini", "Porsche", "McLaren", "Bugatti", "Aston Martin", "Koenigsegg", "Pagani"];
+            const colors = [0xe60026, 0x88ff00, 0x0066ff, 0xff6600, 0x001133, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff, 0x222222];
+            return {
+                id: i + 1,
+                name: `${brands[i % brands.length]} GT-${i + 1}`,
+                color: colors[i % colors.length],
+                topSpeed: 280 + (i * 7),
+                accel: 0.03 + (i * 0.002)
+            };
+        });
+
+        let scene, camera, renderer, currentCarMesh;
+        let currentCarData = CAR_DATABASE[0];
+        let speed = 0;
+        const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false, w: false, s: false, a: false, d: false };
+
+        async function init() {
+            const container = document.getElementById('canvas-container');
+            renderer = new THREE.WebGPURenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            container.appendChild(renderer.domElement);
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x0a0a14);
+            scene.fog = new THREE.FogExp2(0x0a0a14, 0.008);
+
+            camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 2.5);
+            dirLight.position.set(50, 100, 50);
+            scene.add(dirLight);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+
+            createMap();
+            buildUI();
+            spawnCar(currentCarData);
+
+            window.addEventListener('keydown', (e) => handleKey(e, true));
+            window.addEventListener('keyup', (e) => handleKey(e, false));
+            window.addEventListener('resize', onWindowResize);
+
+            renderer.setAnimationLoop(animate);
+        }
+
+        function createMap() {
+            const groundMat = new THREE.MeshStandardMaterial({ color: 0x15151e, roughness: 0.2, metalness: 0.5 });
+            const ground = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000), groundMat);
+            ground.rotation.x = -Math.PI / 2;
+            scene.add(ground);
+
+            // 建造背景建築物
+            const buildingGeo = new THREE.BoxGeometry(1, 1, 1);
+            const buildingMat = new THREE.MeshStandardMaterial({ color: 0x1a1a28, roughness: 0.5, metalness: 0.8 });
+            const instancedBuildings = new THREE.InstancedMesh(buildingGeo, buildingMat, 150);
+            const dummy = new THREE.Object3D();
+
+            let count = 0;
+            for (let x = -6; x <= 6; x++) {
+                for (let z = -6; z <= 6; z++) {
+                    if (Math.abs(x) < 2 && Math.abs(z) < 2) continue;
+                    const posX = x * 90;
+                    const posZ = z * 90;
+                    const height = 30 + Math.random() * 80;
+                    dummy.position.set(posX, height / 2, posZ);
+                    dummy.scale.set(25, height, 25);
+                    dummy.updateMatrix();
+                    instancedBuildings.setMatrixAt(count++, dummy.matrix);
+                }
+            }
+            scene.add(instancedBuildings);
+        }
+
+        function spawnCar(carData) {
+            if (currentCarMesh) scene.remove(currentCarMesh);
+            const carGroup = new THREE.Group();
+
+            const carMat = new THREE.MeshPhysicalMaterial({
+                color: carData.color, metalness: 0.9, roughness: 0.1,
+                clearcoat: 1.0, clearcoatRoughness: 0.03
+            });
+
+            const body = new THREE.Mesh(new THREE.BoxGeometry(2.1, 0.6, 4.4), carMat);
+            body.position.y = 0.5;
+            carGroup.add(body);
+
+            const cabinMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.1, metalness: 0.9 });
+            const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.45, 2.2), cabinMat);
+            cabin.position.set(0, 0.95, -0.2);
+            carGroup.add(cabin);
+
+            if (currentCarMesh) {
+                carGroup.position.copy(currentCarMesh.position);
+                carGroup.rotation.copy(currentCarMesh.rotation);
+            }
+
+            currentCarMesh = carGroup;
+            scene.add(currentCarMesh);
+        }
+
+        function buildUI() {
+            const listEl = document.getElementById('car-list');
+            listEl.innerHTML = '';
+            CAR_DATABASE.forEach((car, index) => {
+                const btn = document.createElement('button');
+                btn.className = `car-btn ${index === 0 ? 'active' : ''}`;
+                btn.innerHTML = `<span>${car.name}</span> <small>${car.topSpeed} KM/H</small>`;
+                btn.onclick = () => {
+                    document.querySelectorAll('.car-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    currentCarData = car;
+                    spawnCar(car);
+                };
+                listEl.appendChild(btn);
+            });
+        }
+
+        function handleKey(e, isDown) {
+            const k = e.key.toLowerCase();
+            if (['arrowup', 'w'].includes(k)) keys.w = isDown;
+            if (['arrowdown', 's'].includes(k)) keys.s = isDown;
+            if (['arrowleft', 'a'].includes(k)) keys.a = isDown;
+            if (['arrowright', 'd'].includes(k)) keys.d = isDown;
+        }
+
+        function animate() {
+            const maxSpeed = currentCarData.topSpeed / 120;
+            if (keys.w) speed = Math.min(speed + currentCarData.accel, maxSpeed);
+            else if (keys.s) speed = Math.max(speed - currentCarData.accel, -maxSpeed * 0.4);
+            else speed *= 0.96;
+
+            if (keys.a) currentCarMesh.rotation.y += 0.03 * (speed / maxSpeed);
+            if (keys.d) currentCarMesh.rotation.y -= 0.03 * (speed / maxSpeed);
+
+            currentCarMesh.translateZ(speed);
+
+            const cameraOffset = new THREE.Vector3(0, 3.5, -8).applyMatrix4(currentCarMesh.matrixWorld);
+            camera.position.lerp(cameraOffset, 0.1);
+            camera.lookAt(currentCarMesh.position.x, currentCarMesh.position.y + 1, currentCarMesh.position.z);
+
+            document.getElementById('hud').innerText = `${Math.round(Math.abs(speed) * 120)} KM/H`;
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        init();
+    </script>
+</body>
+</html>
